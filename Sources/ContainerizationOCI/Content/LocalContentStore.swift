@@ -157,12 +157,18 @@ public actor LocalContentStore: ContentStore {
             throw ContainerizationError(.internalError, message: "Invalid session id \(id)")
         }
         await activeIngestSessions.remove(id)
+
         let temporaryPath = self._ingestPath.appendingPathComponent(id)
         let fileManager = FileManager.default
         defer {
             try? fileManager.removeItem(at: temporaryPath)
         }
-        let tempDigests: [URL] = try fileManager.contentsOfDirectory(at: temporaryPath, includingPropertiesForKeys: nil)
+
+        let tempDigests = try fileManager.contentsOfDirectory(
+            at: temporaryPath,
+            includingPropertiesForKeys: nil
+        )
+
         return try await self._lock.withLock { context in
             var moved: [String] = []
             let fileManager = FileManager.default
@@ -170,7 +176,7 @@ public actor LocalContentStore: ContentStore {
                 try tempDigests.forEach {
                     let digest = $0.lastPathComponent
                     let target = self._blobPath.appendingPathComponent(digest)
-                    // only ingest if not exists
+                    // Only ingest if not exists
                     if !fileManager.fileExists(atPath: target.path) {
                         try fileManager.moveItem(at: $0, to: target)
                         moved.append(digest)
@@ -182,7 +188,7 @@ public actor LocalContentStore: ContentStore {
                 }
                 throw error
             }
-            return tempDigests.map { $0.lastPathComponent }
+            return moved
         }
     }
 
