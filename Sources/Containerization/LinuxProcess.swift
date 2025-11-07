@@ -47,26 +47,36 @@ public final class LinuxProcess: Sendable {
         let stderr: StdioSetup?
     }
 
-    private struct StdioHandles: Sendable {
+    private struct StdioState: Sendable {
+        struct Stream: @unchecked Sendable {
+            let queue: DispatchQueue
+            let source: DispatchSourceRead
+            let handle: FileHandle
+
+            func close() throws {
+                source.cancel()
+                try handle.close()
+            }
+        }
+
         var stdin: FileHandle?
-        var stdout: FileHandle?
-        var stderr: FileHandle?
+        var stdout: Stream?
+        var stderr: Stream?
 
         mutating func close() throws {
-            if let stdin {
-                try stdin.close()
-                stdin.readabilityHandler = nil
-                self.stdin = nil
-            }
             if let stdout {
                 try stdout.close()
-                stdout.readabilityHandler = nil
                 self.stdout = nil
             }
+
             if let stderr {
                 try stderr.close()
-                stderr.readabilityHandler = nil
                 self.stderr = nil
+            }
+
+            if let stdin {
+                try stdin.close()
+                self.stdin = nil
             }
         }
     }
@@ -74,7 +84,7 @@ public final class LinuxProcess: Sendable {
     private struct State {
         var spec: ContainerizationOCI.Spec
         var pid: Int32
-        var stdio: StdioHandles
+        var stdio: StdioState
         var stdinRelay: Task<(), Never>?
         var ioTracker: IoTracker?
 
@@ -108,7 +118,7 @@ public final class LinuxProcess: Sendable {
     ) {
         self.id = id
         self.owningContainer = containerID
-        self.state = Mutex<State>(.init(spec: spec, pid: -1, stdio: StdioHandles()))
+        self.state = Mutex<State>(.init(spec: spec, pid: -1, stdio: StdioState()))
         self.ioSetup = io
         self.agent = agent
         self.vm = vm
@@ -117,6 +127,65 @@ public final class LinuxProcess: Sendable {
 }
 
 extension LinuxProcess {
+    private func makeReadStream(
+        handle: FileHandle,
+        name: String,
+        writer: Writer,
+        continuation: AsyncStream<Void>.Continuation
+    ) throws -> StdioState.Stream {
+        let fd = handle.fileDescriptor
+        let queue = DispatchQueue(label: "com.apple.containerization.stdio.\(name).\(self.id)")
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags != -1 else {
+            throw POSIXError.fromErrno()
+        }
+        guard fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            throw POSIXError.fromErrno()
+        }
+
+        let bufferSize = Int(getpagesize())
+        let buffer = UnsafeMutableRawBufferPointer.allocate(
+            byteCount: bufferSize,
+            alignment: MemoryLayout<UInt8>.alignment
+        )
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        let stream = StdioState.Stream(queue: queue, source: source, handle: handle)
+
+        source.setEventHandler { [logger] in
+            do {
+                let bytesRead = read(fd, buffer.baseAddress!, bufferSize)
+                if bytesRead > 0 {
+                    let data = Data(
+                        bytesNoCopy: buffer.baseAddress!,
+                        count: bytesRead,
+                        deallocator: .none
+                    )
+                    try writer.write(data)
+                } else if bytesRead == 0 {
+                    logger?.info("finished stdin relay for \(name)")
+                    source.cancel()
+                } else if errno != EAGAIN && errno != EINTR {
+                    logger?.error("failed to read from \(name): errno=\(errno)")
+                    source.cancel()
+                }
+            } catch {
+                logger?.error("failed to write to \(name): \(error)")
+                source.cancel()
+            }
+        }
+
+        source.setCancelHandler {
+            buffer.deallocate()
+            continuation.yield()
+        }
+
+        source.resume()
+
+        return stream
+    }
+
     func setupIO(streams: [VsockConnectionStream?]) async throws -> [FileHandle?] {
         let handles = try await Timeout.run(seconds: 3) {
             try await withThrowingTaskGroup(of: (Int, FileHandle?).self) { group in
@@ -181,44 +250,26 @@ extension LinuxProcess {
 
         var configuredStreams = 0
         let (stream, cc) = AsyncStream<Void>.makeStream()
-        if let stdout = self.ioSetup.stdout {
+        var stdout: StdioState.Stream?
+        var stderr: StdioState.Stream?
+
+        // Setup stdout with dedicated queue and pre-allocated buffer
+        if let stdoutSetup = self.ioSetup.stdout, let handle = handles[1] {
             configuredStreams += 1
-            handles[1]?.readabilityHandler = { handle in
-                do {
-                    let data = handle.availableData
-                    if data.isEmpty {
-                        // This block is called when the producer (the guest) closes
-                        // the fd it is writing into.
-                        handles[1]?.readabilityHandler = nil
-                        cc.yield()
-                        return
-                    }
-                    try stdout.writer.write(data)
-                } catch {
-                    self.logger?.error("failed to write to stdout: \(error)")
-                }
-            }
+            stdout = try makeReadStream(handle: handle, name: "stdout", writer: stdoutSetup.writer, continuation: cc)
         }
 
-        if let stderr = self.ioSetup.stderr {
+        // Setup stderr with dedicated queue and pre-allocated buffer
+        if let stderrSetup = self.ioSetup.stderr, let handle = handles[2] {
             configuredStreams += 1
-            handles[2]?.readabilityHandler = { handle in
-                do {
-                    let data = handle.availableData
-                    if data.isEmpty {
-                        handles[2]?.readabilityHandler = nil
-                        cc.yield()
-                        return
-                    }
-                    try stderr.writer.write(data)
-                } catch {
-                    self.logger?.error("failed to write to stderr: \(error)")
-                }
-            }
+            stderr = try makeReadStream(handle: handle, name: "stderr", writer: stderrSetup.writer, continuation: cc)
         }
+
         if configuredStreams > 0 {
             self.state.withLock {
                 $0.ioTracker = .init(stream: stream, cont: cc, configuredStreams: configuredStreams)
+                $0.stdio.stdout = stdout
+                $0.stdio.stderr = stderr
             }
         }
 
@@ -267,11 +318,8 @@ extension LinuxProcess {
             )
 
             self.state.withLock {
-                $0.stdio = StdioHandles(
-                    stdin: result[0],
-                    stdout: result[1],
-                    stderr: result[2]
-                )
+                $0.stdio.stdin = result[0]
+                // stdout and stderr are already set in setupIO
                 $0.pid = pid
             }
         } catch {
