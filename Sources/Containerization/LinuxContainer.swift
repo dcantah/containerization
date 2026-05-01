@@ -191,13 +191,15 @@ public final class LinuxContainer: Container, Sendable {
             let process: LinuxProcess
             var vendedProcesses: [String: LinuxProcess]
             let fileMountContext: FileMountContext
+            let virtualMachinePaused: Bool
 
-            init(_ state: StartedState) {
+            init(_ state: StartedState, virtualMachinePaused: Bool) {
                 self.vm = state.vm
                 self.relayManager = state.relayManager
                 self.process = state.process
                 self.vendedProcesses = state.vendedProcesses
                 self.fileMountContext = state.fileMountContext
+                self.virtualMachinePaused = virtualMachinePaused
             }
         }
 
@@ -872,6 +874,40 @@ extension LinuxContainer {
                 state.setErrored(error: finalError)
                 throw finalError
             }
+        }
+    }
+
+    /// Pause the container by freezing its cgroup. All processes within the
+    /// container will be suspended until resume() is called.
+    ///
+    /// When `virtualMachine` is true, the entire VM is also paused after
+    /// freezing the cgroup. This is a superset of container-only pause.
+    public func pause(virtualMachine: Bool = false) async throws {
+        try await self.state.withLock { state in
+            let startedState = try state.startedState("pause")
+            try await startedState.vm.withAgent { agent in
+                try await agent.freezeContainer(id: self.id)
+            }
+            if virtualMachine {
+                try await startedState.vm.pause()
+            }
+            state = .paused(.init(startedState, virtualMachinePaused: virtualMachine))
+        }
+    }
+
+    /// Resume a paused container by thawing its cgroup. All processes within
+    /// the container will continue execution. If the VM was paused, it is
+    /// resumed first.
+    public func resume() async throws {
+        try await self.state.withLock { state in
+            let pausedState = try state.pausedState("resume")
+            if pausedState.virtualMachinePaused {
+                try await pausedState.vm.resume()
+            }
+            try await pausedState.vm.withAgent { agent in
+                try await agent.resumeContainer(id: self.id)
+            }
+            state = .started(.init(pausedState))
         }
     }
 

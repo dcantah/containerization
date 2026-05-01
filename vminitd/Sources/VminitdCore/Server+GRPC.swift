@@ -1581,6 +1581,56 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
             $0.result = r
         }
     }
+
+    public func freezeContainer(
+        request: Com_Apple_Containerization_Sandbox_V3_FreezeContainerRequest,
+        context: GRPCCore.ServerContext
+    ) async throws -> Com_Apple_Containerization_Sandbox_V3_FreezeContainerResponse {
+        log.debug(
+            "freezeContainer",
+            metadata: [
+                "containerID": "\(request.containerID)"
+            ])
+
+        do {
+            let ctr = try await self.state.get(container: request.containerID)
+            try await ctr.freeze()
+            return .init()
+        } catch {
+            log.error(
+                "freezeContainer",
+                metadata: [
+                    "containerID": "\(request.containerID)",
+                    "error": "\(error)",
+                ])
+            throw RPCError(code: .internalError, message: "freezeContainer", cause: error)
+        }
+    }
+
+    public func resumeContainer(
+        request: Com_Apple_Containerization_Sandbox_V3_ResumeContainerRequest,
+        context: GRPCCore.ServerContext
+    ) async throws -> Com_Apple_Containerization_Sandbox_V3_ResumeContainerResponse {
+        log.debug(
+            "resumeContainer",
+            metadata: [
+                "containerID": "\(request.containerID)"
+            ])
+
+        do {
+            let ctr = try await self.state.get(container: request.containerID)
+            try await ctr.thaw()
+            return .init()
+        } catch {
+            log.error(
+                "resumeContainer",
+                metadata: [
+                    "containerID": "\(request.containerID)",
+                    "error": "\(error)",
+                ])
+            throw RPCError(code: .internalError, message: "resumeContainer", cause: error)
+        }
+    }
 }
 
 extension Com_Apple_Containerization_Sandbox_V3_ConfigureHostsRequest {

@@ -2087,4 +2087,119 @@ extension IntegrationSuite {
             }
         }
     }
+
+    func testPodPauseResume() async throws {
+        let id = "test-pod-pause-resume"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("container1", rootfs: bs.rootfs) { config in
+            config.process.arguments = ["/bin/sleep", "100"]
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("container1")
+
+            try await pod.pause()
+            try await pod.resume()
+
+            let buffer = BufferWriter()
+            let exec = try await pod.execInContainer("container1", processID: "after-resume") { config in
+                config.arguments = ["/bin/echo", "pod-resumed"]
+                config.stdout = buffer
+            }
+
+            try await exec.start()
+            let status = try await exec.wait()
+            try await exec.delete()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "exec after pod resume status \(status) != 0")
+            }
+
+            guard String(data: buffer.data, encoding: .utf8) == "pod-resumed\n" else {
+                throw IntegrationError.assert(
+                    msg: "expected 'pod-resumed' but got '\(String(data: buffer.data, encoding: .utf8) ?? "<nil>")'")
+            }
+
+            try await pod.killContainer("container1", signal: .kill)
+            try await pod.waitContainer("container1")
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    func testPodPauseResumeMultipleContainers() async throws {
+        let id = "test-pod-pause-resume-multi"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("container1", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "container1")) { config in
+            config.process.arguments = ["/bin/sleep", "100"]
+        }
+
+        try await pod.addContainer("container2", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "container2")) { config in
+            config.process.arguments = ["/bin/sleep", "100"]
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("container1")
+            try await pod.startContainer("container2")
+
+            try await pod.pause()
+            try await pod.resume()
+
+            let buffer1 = BufferWriter()
+            let exec1 = try await pod.execInContainer("container1", processID: "exec1") { config in
+                config.arguments = ["/bin/echo", "c1"]
+                config.stdout = buffer1
+            }
+            try await exec1.start()
+            let status1 = try await exec1.wait()
+            try await exec1.delete()
+
+            let buffer2 = BufferWriter()
+            let exec2 = try await pod.execInContainer("container2", processID: "exec2") { config in
+                config.arguments = ["/bin/echo", "c2"]
+                config.stdout = buffer2
+            }
+            try await exec2.start()
+            let status2 = try await exec2.wait()
+            try await exec2.delete()
+
+            guard status1.exitCode == 0, status2.exitCode == 0 else {
+                throw IntegrationError.assert(
+                    msg: "exec statuses: container1=\(status1.exitCode), container2=\(status2.exitCode)")
+            }
+
+            guard String(data: buffer1.data, encoding: .utf8) == "c1\n",
+                String(data: buffer2.data, encoding: .utf8) == "c2\n"
+            else {
+                throw IntegrationError.assert(msg: "unexpected exec output after pod resume")
+            }
+
+            try await pod.killContainer("container1", signal: .kill)
+            try await pod.killContainer("container2", signal: .kill)
+            try await pod.waitContainer("container1")
+            try await pod.waitContainer("container2")
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
 }

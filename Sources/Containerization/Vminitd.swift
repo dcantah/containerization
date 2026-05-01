@@ -456,6 +456,20 @@ extension Vminitd {
         return response.result
     }
 
+    public func freezeContainer(id: String) async throws {
+        _ = try await client.freezeContainer(
+            .with {
+                $0.containerID = id
+            })
+    }
+
+    public func resumeContainer(id: String) async throws {
+        _ = try await client.resumeContainer(
+            .with {
+                $0.containerID = id
+            })
+    }
+
     /// Metadata received from the guest during a copy operation.
     public struct CopyMetadata: Sendable {
         /// Whether the data on the vsock channel is a tar+gzip archive.

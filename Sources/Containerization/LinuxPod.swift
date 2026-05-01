@@ -1014,6 +1014,46 @@ extension LinuxPod {
         }
     }
 
+    /// Pause the pod by freezing all started containers and then pausing the
+    /// virtual machine. This is the inverse of resume().
+    public func pause() async throws {
+        try await self.state.withLock { state in
+            let createdState = try state.phase.createdState("pause")
+
+            let startedContainerIDs = state.containers
+                .filter { $0.value.state == .started }
+                .map { $0.key }
+
+            try await createdState.vm.withAgent { agent in
+                for containerID in startedContainerIDs {
+                    try await agent.freezeContainer(id: containerID)
+                }
+            }
+
+            try await createdState.vm.pause()
+        }
+    }
+
+    /// Resume a paused pod by resuming the virtual machine and then thawing all
+    /// frozen containers. This is the inverse of pause().
+    public func resume() async throws {
+        try await self.state.withLock { state in
+            let createdState = try state.phase.createdState("resume")
+
+            let startedContainerIDs = state.containers
+                .filter { $0.value.state == .started }
+                .map { $0.key }
+
+            try await createdState.vm.resume()
+
+            try await createdState.vm.withAgent { agent in
+                for containerID in startedContainerIDs {
+                    try await agent.resumeContainer(id: containerID)
+                }
+            }
+        }
+    }
+
     /// Wait for a container to exit. Returns the exit code.
     @discardableResult
     public func waitContainer(_ containerID: String, timeoutInSeconds: Int64? = nil) async throws -> ExitStatus {

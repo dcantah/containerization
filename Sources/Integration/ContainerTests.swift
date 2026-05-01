@@ -4933,4 +4933,137 @@ extension IntegrationSuite {
                 msg: "expected 'deep-content' but got '\(value ?? "<nil>")'")
         }
     }
+
+    func testPauseResume() async throws {
+        let id = "test-pause-resume"
+
+        let bs = try await bootstrap(id)
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+            config.process.arguments = ["sleep", "infinity"]
+            config.bootLog = bs.bootLog
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+
+            try await container.pause()
+
+            let buffer = BufferWriter()
+            let exec = try await container.exec("after-resume") { config in
+                config.arguments = ["/bin/echo", "resumed"]
+                config.stdout = buffer
+            }
+
+            try await container.resume()
+
+            try await exec.start()
+            let status = try await exec.wait()
+            try await exec.delete()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "exec after resume status \(status) != 0")
+            }
+
+            guard String(data: buffer.data, encoding: .utf8) == "resumed\n" else {
+                throw IntegrationError.assert(
+                    msg: "expected 'resumed' but got '\(String(data: buffer.data, encoding: .utf8) ?? "<nil>")'")
+            }
+
+            try await container.kill(.kill)
+            try await container.wait()
+            try await container.stop()
+        } catch {
+            try? await container.stop()
+            throw error
+        }
+    }
+
+    func testPauseResumeVM() async throws {
+        let id = "test-pause-resume-vm"
+
+        let bs = try await bootstrap(id)
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+            config.process.arguments = ["sleep", "infinity"]
+            config.bootLog = bs.bootLog
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+
+            try await container.pause(virtualMachine: true)
+            try await container.resume()
+
+            let buffer = BufferWriter()
+            let exec = try await container.exec("after-vm-resume") { config in
+                config.arguments = ["/bin/echo", "vm-resumed"]
+                config.stdout = buffer
+            }
+
+            try await exec.start()
+            let status = try await exec.wait()
+            try await exec.delete()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "exec after vm resume status \(status) != 0")
+            }
+
+            guard String(data: buffer.data, encoding: .utf8) == "vm-resumed\n" else {
+                throw IntegrationError.assert(
+                    msg: "expected 'vm-resumed' but got '\(String(data: buffer.data, encoding: .utf8) ?? "<nil>")'")
+            }
+
+            try await container.kill(.kill)
+            try await container.wait()
+            try await container.stop()
+        } catch {
+            try? await container.stop()
+            throw error
+        }
+    }
+
+    func testPauseRejectsOtherOperations() async throws {
+        let id = "test-pause-rejects-ops"
+
+        let bs = try await bootstrap(id)
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+            config.process.arguments = ["sleep", "infinity"]
+            config.bootLog = bs.bootLog
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+
+            try await container.pause()
+
+            do {
+                try await container.kill(.term)
+                throw IntegrationError.assert(msg: "kill should have failed on paused container")
+            } catch let error as ContainerizationError {
+                guard error.isCode(.invalidState) else {
+                    throw IntegrationError.assert(msg: "expected invalidState error, got: \(error)")
+                }
+            }
+
+            do {
+                try await container.stop()
+                throw IntegrationError.assert(msg: "stop should have failed on paused container")
+            } catch let error as ContainerizationError {
+                guard error.isCode(.invalidState) else {
+                    throw IntegrationError.assert(msg: "expected invalidState error, got: \(error)")
+                }
+            }
+
+            try await container.resume()
+            try await container.kill(.kill)
+            try await container.wait()
+            try await container.stop()
+        } catch {
+            try? await container.resume()
+            try? await container.stop()
+            throw error
+        }
+    }
 }

@@ -47,6 +47,7 @@ public struct Cgroup2Manager: Sendable {
     public static let defaultMountPoint = URL(filePath: "/sys/fs/cgroup")
 
     private static let killFile = "cgroup.kill"
+    private static let freezeFile = "cgroup.freeze"
     private static let procsFile = "cgroup.procs"
     private static let subtreeControlFile = "cgroup.subtree_control"
 
@@ -289,6 +290,22 @@ public struct Cgroup2Manager: Sendable {
             path: self.path,
             value: "1",
             fileName: Self.killFile
+        )
+    }
+
+    package func freeze() throws {
+        try Self.writeValue(
+            path: self.path,
+            value: "1",
+            fileName: Self.freezeFile
+        )
+    }
+
+    package func thaw() throws {
+        try Self.writeValue(
+            path: self.path,
+            value: "0",
+            fileName: Self.freezeFile
         )
     }
 

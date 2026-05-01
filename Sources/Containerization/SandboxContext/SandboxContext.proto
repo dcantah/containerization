@@ -72,6 +72,10 @@ service SandboxContext {
   rpc Sync(SyncRequest) returns (SyncResponse);
   // Send a signal to a process via the PID.
   rpc Kill(KillRequest) returns (KillResponse);
+  // Freeze a container's cgroup, suspending all processes within it.
+  rpc FreezeContainer(FreezeContainerRequest) returns (FreezeContainerResponse);
+  // Resume a frozen container's cgroup, resuming all processes within it.
+  rpc ResumeContainer(ResumeContainerRequest) returns (ResumeContainerResponse);
 }
 
 message Stdio {
@@ -354,6 +358,12 @@ message KillRequest {
 }
 
 message KillResponse { int32 result = 1; }
+
+message FreezeContainerRequest { string container_id = 1; }
+message FreezeContainerResponse {}
+
+message ResumeContainerRequest { string container_id = 1; }
+message ResumeContainerResponse {}
 
 // Categories of statistics that can be requested.
 enum StatCategory {

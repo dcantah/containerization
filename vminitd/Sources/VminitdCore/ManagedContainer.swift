@@ -236,6 +236,14 @@ extension ManagedContainer {
         try self.cgroupManager.getMemoryEvents()
     }
 
+    func freeze() throws {
+        try self.cgroupManager.freeze()
+    }
+
+    func thaw() throws {
+        try self.cgroupManager.thaw()
+    }
+
     func getExecOrInit(execID: String) throws -> any ContainerProcess {
         if execID == self.id {
             return self.initProcess
