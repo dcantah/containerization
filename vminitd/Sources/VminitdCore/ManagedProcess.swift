@@ -136,7 +136,9 @@ final class ManagedProcess: ContainerProcess, Sendable {
 
         log.info("starting I/O")
 
-        // Setup IO early. We expect the host to be listening already.
+        // Setup IO early. We bind the stdio vsock listeners here and block
+        // until the host dials each one, so the connections are live before
+        // the process execs.
         try io.start(process: &command)
 
         self.command = command

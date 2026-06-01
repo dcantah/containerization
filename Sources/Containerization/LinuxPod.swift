@@ -155,12 +155,14 @@ public final class LinuxPod: Sendable {
 
     private let state: AsyncMutex<State>
 
-    // Ports to be allocated from for stdio and for
-    // unix socket relays that are sharing a guest
-    // uds to the host.
+    // Ports the host listens on over vsock and the guest dials. Used by
+    // unix socket relays that expose a host uds inside the guest, and by
+    // file copy transfers.
     private let hostVsockPorts: Atomic<UInt32>
-    // Ports we request the guest to allocate for unix socket relays from
-    // the host.
+    // Ports the guest listens on over vsock and the host dials. Used by
+    // process stdio and by unix socket relays that expose a guest uds on
+    // the host. The guest listens so these connections can be re-established
+    // after a save/restore.
     private let guestVsockPorts: Atomic<UInt32>
 
     private struct State: Sendable {
@@ -831,7 +833,7 @@ extension LinuxPod {
                 spec.linux?.namespaces = namespaces
 
                 let stdio = IOUtil.setup(
-                    portAllocator: self.hostVsockPorts,
+                    portAllocator: self.guestVsockPorts,
                     stdin: container.config.process.stdin,
                     stdout: container.config.process.stdout,
                     stderr: container.config.process.stderr
@@ -1118,7 +1120,7 @@ extension LinuxPod {
             spec.process = config.toOCI()
 
             let stdio = IOUtil.setup(
-                portAllocator: self.hostVsockPorts,
+                portAllocator: self.guestVsockPorts,
                 stdin: config.stdin,
                 stdout: config.stdout,
                 stderr: config.stderr

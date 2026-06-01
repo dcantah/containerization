@@ -59,24 +59,19 @@ final class TerminalIO: ManagedProcess.IO & Sendable {
             process.stdout = nil
             process.stderr = nil
 
-            if let stdinPort = self.hostStdio.stdin {
-                let type = VsockType(
-                    port: stdinPort,
-                    cid: VsockType.hostCID
-                )
-                let stdinSocket = try Socket(type: type, closeOnDeinit: false)
-                try stdinSocket.connect()
-                $0.stdinSocket = stdinSocket
+            // Bind both listeners before accepting so the host can dial either
+            // port without waiting on the other. The host is the dialer; we
+            // listen so the connections can be re-established after a
+            // save/restore.
+            let stdinListener = try self.hostStdio.stdin.map { try VsockStdio.bind(port: $0) }
+            let stdoutListener = try self.hostStdio.stdout.map { try VsockStdio.bind(port: $0) }
+
+            if let stdinListener {
+                $0.stdinSocket = try VsockStdio.accept(listener: stdinListener)
             }
 
-            if let stdoutPort = self.hostStdio.stdout {
-                let type = VsockType(
-                    port: stdoutPort,
-                    cid: VsockType.hostCID
-                )
-                let stdoutSocket = try Socket(type: type, closeOnDeinit: false)
-                try stdoutSocket.connect()
-                $0.stdoutSocket = stdoutSocket
+            if let stdoutListener {
+                $0.stdoutSocket = try VsockStdio.accept(listener: stdoutListener)
             }
         }
     }

@@ -51,17 +51,20 @@ final class StandardIO: ManagedProcess.IO & Sendable {
 
     func start(process: inout Command) throws {
         try self.state.withLock {
-            if let stdinPort = self.hostStdio.stdin {
+            // Bind all of the vsock listeners up front so the host can dial any
+            // stdio port without waiting on us to finish accepting an earlier one.
+            // The host is the dialer; we listen so the connections can be
+            // re-established after a save/restore.
+            let stdinListener = try self.hostStdio.stdin.map { try VsockStdio.bind(port: $0) }
+            let stdoutListener = try self.hostStdio.stdout.map { try VsockStdio.bind(port: $0) }
+            let stderrListener = try self.hostStdio.stderr.map { try VsockStdio.bind(port: $0) }
+
+            if let stdinListener {
                 let inPipe = Pipe()
                 process.stdin = inPipe.fileHandleForReading
                 $0.stdinPipe = inPipe
 
-                let type = VsockType(
-                    port: stdinPort,
-                    cid: VsockType.hostCID
-                )
-                let stdinSocket = try Socket(type: type, closeOnDeinit: false)
-                try stdinSocket.connect()
+                let stdinSocket = try VsockStdio.accept(listener: stdinListener)
 
                 let pair = IOPair(
                     readFrom: stdinSocket,
@@ -74,17 +77,12 @@ final class StandardIO: ManagedProcess.IO & Sendable {
                 try pair.relay()
             }
 
-            if let stdoutPort = self.hostStdio.stdout {
+            if let stdoutListener {
                 let outPipe = Pipe()
                 process.stdout = outPipe.fileHandleForWriting
                 $0.stdoutPipe = outPipe
 
-                let type = VsockType(
-                    port: stdoutPort,
-                    cid: VsockType.hostCID
-                )
-                let stdoutSocket = try Socket(type: type, closeOnDeinit: false)
-                try stdoutSocket.connect()
+                let stdoutSocket = try VsockStdio.accept(listener: stdoutListener)
 
                 let pair = IOPair(
                     readFrom: outPipe.fileHandleForReading,
@@ -97,17 +95,12 @@ final class StandardIO: ManagedProcess.IO & Sendable {
                 try pair.relay()
             }
 
-            if let stderrPort = self.hostStdio.stderr {
+            if let stderrListener {
                 let errPipe = Pipe()
                 process.stderr = errPipe.fileHandleForWriting
                 $0.stderrPipe = errPipe
 
-                let type = VsockType(
-                    port: stderrPort,
-                    cid: VsockType.hostCID
-                )
-                let stderrSocket = try Socket(type: type, closeOnDeinit: false)
-                try stderrSocket.connect()
+                let stderrSocket = try VsockStdio.accept(listener: stderrListener)
 
                 let pair = IOPair(
                     readFrom: errPipe.fileHandleForReading,

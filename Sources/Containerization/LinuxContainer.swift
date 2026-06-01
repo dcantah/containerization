@@ -130,12 +130,14 @@ public final class LinuxContainer: Container, Sendable {
 
     private let state: AsyncMutex<State>
 
-    // Ports to be allocated from for stdio and for
-    // unix socket relays that are sharing a guest
-    // uds to the host.
+    // Ports the host listens on over vsock and the guest dials. Used by
+    // unix socket relays that expose a host uds inside the guest, and by
+    // file copy transfers.
     private let hostVsockPorts: Atomic<UInt32>
-    // Ports we request the guest to allocate for unix socket relays from
-    // the host.
+    // Ports the guest listens on over vsock and the host dials. Used by
+    // process stdio and by unix socket relays that expose a guest uds on
+    // the host. The guest listens so these connections can be re-established
+    // after a save/restore.
     private let guestVsockPorts: Atomic<UInt32>
 
     // Queue for copy IO.
@@ -735,7 +737,7 @@ extension LinuxContainer {
                 spec.mounts = cleanAndSortMounts(mounts)
 
                 let stdio = IOUtil.setup(
-                    portAllocator: self.hostVsockPorts,
+                    portAllocator: self.guestVsockPorts,
                     stdin: self.config.process.stdin,
                     stdout: self.config.process.stdout,
                     stderr: self.config.process.stderr
@@ -953,7 +955,7 @@ extension LinuxContainer {
             spec.process = config.toOCI()
 
             let stdio = IOUtil.setup(
-                portAllocator: self.hostVsockPorts,
+                portAllocator: self.guestVsockPorts,
                 stdin: config.stdin,
                 stdout: config.stdout,
                 stderr: config.stderr
@@ -990,7 +992,7 @@ extension LinuxContainer {
             spec.process = configuration.toOCI()
 
             let stdio = IOUtil.setup(
-                portAllocator: self.hostVsockPorts,
+                portAllocator: self.guestVsockPorts,
                 stdin: configuration.stdin,
                 stdout: configuration.stdout,
                 stderr: configuration.stderr

@@ -124,26 +124,52 @@ public final class LinuxProcess: Sendable {
 }
 
 extension LinuxProcess {
-    func setupIO(listeners: [VsockListener?]) async throws -> [FileHandle?] {
-        let handles = try await Timeout.run(seconds: 3) {
-            try await withThrowingTaskGroup(of: (Int, FileHandle?).self) { group in
-                var results = [FileHandle?](repeating: nil, count: 3)
+    /// Dial a guest stdio vsock listener, retrying until the guest has bound it.
+    ///
+    /// The guest binds its stdio listeners while servicing createProcess, so a
+    /// dial issued concurrently may briefly race ahead of the bind.
+    private func dialStdio(port: UInt32) async throws -> FileHandle {
+        let retries = 200
+        let sleepDuration: Duration = .milliseconds(20)
 
-                for (index, listener) in listeners.enumerated() {
-                    guard let listener else { continue }
-
-                    group.addTask {
-                        let first = await listener.first(where: { _ in true })
-                        try listener.finish()
-                        return (index, first)
-                    }
-                }
-
-                for try await (index, fileHandle) in group {
-                    results[index] = fileHandle
-                }
-                return results
+        var lastError: Error?
+        for _ in 0...retries {
+            do {
+                return try await self.vm.dial(port)
+            } catch {
+                lastError = error
+                try await Task.sleep(for: sleepDuration)
             }
+        }
+        throw ContainerizationError(
+            .timeout,
+            message: "failed to dial guest stdio vsock port \(port)",
+            cause: lastError
+        )
+    }
+
+    func setupIO() async throws -> [FileHandle?] {
+        let ports: [UInt32?] = [
+            self.ioSetup.stdin?.port,
+            self.ioSetup.stdout?.port,
+            self.ioSetup.stderr?.port,
+        ]
+
+        let handles = try await withThrowingTaskGroup(of: (Int, FileHandle?).self) { group in
+            var results = [FileHandle?](repeating: nil, count: 3)
+
+            for (index, port) in ports.enumerated() {
+                guard let port else { continue }
+
+                group.addTask {
+                    (index, try await self.dialStdio(port: port))
+                }
+            }
+
+            for try await (index, fileHandle) in group {
+                results[index] = fileHandle
+            }
+            return results
         }
 
         // Note: stdin relay is started separately via startStdinRelay() after
@@ -239,25 +265,21 @@ extension LinuxProcess {
     public func start() async throws {
         do {
             let spec = self.state.withLock { $0.spec }
-            var listeners = [VsockListener?](repeating: nil, count: 3)
-            if let stdin = self.ioSetup.stdin {
-                listeners[0] = try self.vm.listen(stdin.port)
-            }
-            if let stdout = self.ioSetup.stdout {
-                listeners[1] = try self.vm.listen(stdout.port)
-            }
-            if let stderr = self.ioSetup.stderr {
-                if spec.process!.terminal {
-                    throw ContainerizationError(
-                        .invalidArgument,
-                        message: "stderr should not be configured with terminal=true"
-                    )
-                }
-                listeners[2] = try self.vm.listen(stderr.port)
+
+            if spec.process!.terminal, self.ioSetup.stderr != nil {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "stderr should not be configured with terminal=true"
+                )
             }
 
-            let t = Task {
-                try await self.setupIO(listeners: listeners)
+            // The guest binds vsock listeners for our stdio ports while it
+            // services createProcess and blocks accepting them. Dial those
+            // listeners in a task so the guest can accept and createProcess can
+            // return. The guest is the listener so that stdio can be
+            // re-established after a save/restore.
+            let ioTask = Task {
+                try await self.setupIO()
             }
 
             try await agent.createProcess(
@@ -271,7 +293,8 @@ extension LinuxProcess {
                 options: nil
             )
 
-            let result = try await t.value
+            let handles = try await ioTask.value
+
             let pid = try await self.agent.startProcess(
                 id: self.id,
                 containerID: self.owningContainer
@@ -279,15 +302,15 @@ extension LinuxProcess {
 
             // Start stdin relay after process launch to avoid filling the pipe
             // buffer before the process is even running.
-            if let stdinHandle = result[0] {
+            if let stdinHandle = handles[0] {
                 self.startStdinRelay(handle: stdinHandle)
             }
 
             self.state.withLock {
                 $0.stdio = StdioHandles(
-                    stdin: result[0],
-                    stdout: result[1],
-                    stderr: result[2]
+                    stdin: handles[0],
+                    stdout: handles[1],
+                    stderr: handles[2]
                 )
                 $0.pid = pid
             }
