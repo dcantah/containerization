@@ -25,7 +25,7 @@ public struct UnixSocketConfiguration: Sendable {
         _id
     }
 
-    private let _id = UUID().uuidString
+    private var _id = UUID().uuidString
 
     /// The path to the socket you'd like relayed. For .into
     /// direction this should be the path on the host to a unix socket.
@@ -62,6 +62,23 @@ public struct UnixSocketConfiguration: Sendable {
         permissions: FilePermissions? = nil,
         direction: Direction = .into
     ) {
+        self.source = source
+        self.destination = destination
+        self.permissions = permissions
+        self.direction = direction
+    }
+
+    /// Reconstruct a configuration with a known id. Used on restore so the
+    /// guest-side `VsockProxy` (created under the original id and preserved in
+    /// the saved VM memory) can still be matched for teardown at stop.
+    package init(
+        id: String,
+        source: URL,
+        destination: URL,
+        permissions: FilePermissions? = nil,
+        direction: Direction = .into
+    ) {
+        self._id = id
         self.source = source
         self.destination = destination
         self.permissions = permissions

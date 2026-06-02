@@ -21,6 +21,7 @@ import Foundation
 public enum VirtualMachineInstanceState: Sendable {
     case starting
     case running
+    case paused
     case stopped
     case stopping
     case unknown
@@ -49,6 +50,21 @@ public protocol VirtualMachineInstance: Sendable {
     func pause() async throws
     /// Resume the virtual machine.
     func resume() async throws
+    /// Save the paused virtual machine's state to a file.
+    ///
+    /// The virtual machine must be paused. On success the file at `url`
+    /// contains the full machine state and the VM remains paused.
+    func save(to url: URL) async throws
+    /// Restore a stopped virtual machine from a file produced by `save(to:)`.
+    ///
+    /// The virtual machine must be stopped. On success the VM is paused and
+    /// can be brought back to running with `resume()`.
+    func restore(from url: URL) async throws
+    /// Validate that this instance's configuration supports save/restore.
+    ///
+    /// Not all device configurations can be saved and restored. Call this
+    /// before relying on `save(to:)` / `restore(from:)`.
+    func validateSaveRestoreSupport() throws
 
     /// Hotplug a block device, returning the attached filesystem info.
     /// Throws if the VMM does not support hotplug or not available
@@ -86,6 +102,15 @@ extension VirtualMachineInstance {
     }
     public func resume() async throws {
         throw ContainerizationError(.unsupported, message: "resume")
+    }
+    public func save(to url: URL) async throws {
+        throw ContainerizationError(.unsupported, message: "save")
+    }
+    public func restore(from url: URL) async throws {
+        throw ContainerizationError(.unsupported, message: "restore")
+    }
+    public func validateSaveRestoreSupport() throws {
+        throw ContainerizationError(.unsupported, message: "validateSaveRestoreSupport")
     }
     public func hotplug(_ block: Mount, id: String) async throws -> AttachedFilesystem {
         throw ContainerizationError(.unsupported, message: "hotplug not supported")

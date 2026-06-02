@@ -30,8 +30,23 @@ public protocol Interface: Sendable {
 
     /// The interface MTU (Maximum Transmission Unit).
     var mtu: UInt32 { get }
+
+    /// Returns a copy of the interface with its MAC address set to `macAddress`
+    /// if, and only if, the interface does not already specify one.
+    ///
+    /// The container uses this to guarantee every interface has a stable MAC.
+    /// A MAC must be fixed so that a saved virtual machine can be restored
+    /// against a byte-for-byte identical configuration; otherwise
+    /// Virtualization.framework assigns a fresh random MAC on each build and
+    /// the saved state no longer matches. Conformers that can carry a MAC
+    /// should implement this; the default returns the interface unchanged.
+    func resolvingMACAddress(_ macAddress: MACAddress) -> any Interface
 }
 
 extension Interface {
     public var mtu: UInt32 { 1500 }
+
+    public func resolvingMACAddress(_ macAddress: MACAddress) -> any Interface {
+        self
+    }
 }

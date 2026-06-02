@@ -73,4 +73,10 @@ extension UnixSocketRelayManager {
             try relay.stop()
         }
     }
+
+    /// The (configuration, port) pairs of the currently active relays, used to
+    /// re-establish the host side after a restore.
+    func assignments() -> [(configuration: UnixSocketConfiguration, port: UInt32)] {
+        relays.values.map { ($0.relayConfiguration, $0.relayPort) }
+    }
 }

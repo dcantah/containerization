@@ -105,6 +105,17 @@ public struct VmnetNetwork: Network {
             config.attachment = VZVmnetNetworkDeviceAttachment(network: self.reference)
             return config
         }
+
+        public func resolvingMACAddress(_ macAddress: MACAddress) -> any Containerization.Interface {
+            guard self.macAddress == nil else { return self }
+            return Interface(
+                reference: self.reference,
+                ipv4Address: self.ipv4Address,
+                ipv4Gateway: self.ipv4Gateway,
+                macAddress: macAddress,
+                mtu: self.mtu
+            )
+        }
     }
 
     /// Creates a new network.

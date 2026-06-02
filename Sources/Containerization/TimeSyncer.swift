@@ -28,6 +28,10 @@ actor TimeSyncer {
         self.logger = logger
     }
 
+    /// Whether the periodic sync task has been started (it stays started across
+    /// pause/resume and is only torn down by `close()`).
+    var wasStarted: Bool { self.task != nil }
+
     func start(context: Vminitd, interval: Duration = .seconds(30)) {
         guard self.task == nil else {
             return

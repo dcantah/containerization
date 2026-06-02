@@ -63,6 +63,17 @@ public final class NATNetworkInterface: Interface, Sendable {
         self.mtu = mtu
         self.reference = nil
     }
+
+    public func resolvingMACAddress(_ macAddress: MACAddress) -> any Interface {
+        guard self.macAddress == nil, let reference = self.reference else { return self }
+        return NATNetworkInterface(
+            ipv4Address: self.ipv4Address,
+            ipv4Gateway: self.ipv4Gateway,
+            reference: reference,
+            macAddress: macAddress,
+            mtu: self.mtu
+        )
+    }
 }
 
 @available(macOS 26, *)

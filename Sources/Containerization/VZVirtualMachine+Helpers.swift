@@ -119,6 +119,36 @@ extension VZVirtualMachine {
             }
         }
     }
+
+    #if arch(arm64)
+    func save(queue: DispatchQueue, to url: URL) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            queue.sync {
+                self.saveMachineStateTo(url: url) { error in
+                    if let error {
+                        cont.resume(throwing: error)
+                        return
+                    }
+                    cont.resume()
+                }
+            }
+        }
+    }
+
+    func restore(queue: DispatchQueue, from url: URL) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            queue.sync {
+                self.restoreMachineStateFrom(url: url) { error in
+                    if let error {
+                        cont.resume(throwing: error)
+                        return
+                    }
+                    cont.resume()
+                }
+            }
+        }
+    }
+    #endif
 }
 
 extension VZVirtualMachine {

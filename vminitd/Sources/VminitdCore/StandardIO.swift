@@ -22,15 +22,35 @@ import Foundation
 import Logging
 import Synchronization
 
+/// Relays a process's standard streams to the host over vsock.
+///
+/// The guest binds a vsock listener per stream and the host dials in. The
+/// listeners are kept open and accept is driven off the shared epoll loop, so
+/// the host can reconnect (for example after the VM is saved and restored)
+/// without spawning a thread per stream. The relay between a stream's pipe and
+/// the vsock connection is rebuilt each time the host (re)connects.
+///
+/// The pre-exec handshake (stdio connected before the process starts) is
+/// enforced on the host: it only starts the process once its dials succeed.
 final class StandardIO: ManagedProcess.IO & Sendable {
     private struct State {
-        var stdin: IOPair?
-        var stdout: IOPair?
-        var stderr: IOPair?
-
+        // Pipes bridging the child process and the relays. The parent-side end
+        // of each pipe persists across reconnections; the child-side end is
+        // closed after exec.
         var stdinPipe: Pipe?
         var stdoutPipe: Pipe?
         var stderrPipe: Pipe?
+
+        // Listeners stay open for the lifetime of the process so the host can
+        // reconnect.
+        var stdinListener: Socket?
+        var stdoutListener: Socket?
+        var stderrListener: Socket?
+
+        // The relay for the currently connected host, replaced on reconnect.
+        var stdin: IOPair?
+        var stdout: IOPair?
+        var stderr: IOPair?
     }
 
     private let log: Logger?
@@ -51,66 +71,111 @@ final class StandardIO: ManagedProcess.IO & Sendable {
 
     func start(process: inout Command) throws {
         try self.state.withLock {
-            // Bind all of the vsock listeners up front so the host can dial any
-            // stdio port without waiting on us to finish accepting an earlier one.
-            // The host is the dialer; we listen so the connections can be
-            // re-established after a save/restore.
-            let stdinListener = try self.hostStdio.stdin.map { try VsockStdio.bind(port: $0) }
-            let stdoutListener = try self.hostStdio.stdout.map { try VsockStdio.bind(port: $0) }
-            let stderrListener = try self.hostStdio.stderr.map { try VsockStdio.bind(port: $0) }
-
-            if let stdinListener {
+            if let stdinPort = self.hostStdio.stdin {
                 let inPipe = Pipe()
                 process.stdin = inPipe.fileHandleForReading
                 $0.stdinPipe = inPipe
 
-                let stdinSocket = try VsockStdio.accept(listener: stdinListener)
-
-                let pair = IOPair(
-                    readFrom: stdinSocket,
-                    writeTo: inPipe.fileHandleForWriting,
-                    reason: "StandardIO stdin",
-                    logger: log
-                )
-                $0.stdin = pair
-
-                try pair.relay()
+                let listener = try VsockStdio.bind(port: stdinPort)
+                $0.stdinListener = listener
+                try self.registerStdinAccept(listener: listener, pipe: inPipe)
             }
 
-            if let stdoutListener {
+            if let stdoutPort = self.hostStdio.stdout {
                 let outPipe = Pipe()
                 process.stdout = outPipe.fileHandleForWriting
                 $0.stdoutPipe = outPipe
 
-                let stdoutSocket = try VsockStdio.accept(listener: stdoutListener)
-
-                let pair = IOPair(
-                    readFrom: outPipe.fileHandleForReading,
-                    writeTo: stdoutSocket,
+                let listener = try VsockStdio.bind(port: stdoutPort)
+                $0.stdoutListener = listener
+                try self.registerOutputAccept(
+                    listener: listener,
+                    pipe: outPipe,
                     reason: "StandardIO stdout",
-                    logger: log
+                    store: { $0.stdout = $1 },
+                    current: { $0.stdout }
                 )
-                $0.stdout = pair
-
-                try pair.relay()
             }
 
-            if let stderrListener {
+            if let stderrPort = self.hostStdio.stderr {
                 let errPipe = Pipe()
                 process.stderr = errPipe.fileHandleForWriting
                 $0.stderrPipe = errPipe
 
-                let stderrSocket = try VsockStdio.accept(listener: stderrListener)
-
-                let pair = IOPair(
-                    readFrom: errPipe.fileHandleForReading,
-                    writeTo: stderrSocket,
+                let listener = try VsockStdio.bind(port: stderrPort)
+                $0.stderrListener = listener
+                try self.registerOutputAccept(
+                    listener: listener,
+                    pipe: errPipe,
                     reason: "StandardIO stderr",
-                    logger: log
+                    store: { $0.stderr = $1 },
+                    current: { $0.stderr }
                 )
-                $0.stderr = pair
+            }
+        }
+    }
 
-                try pair.relay()
+    /// Register the stdin listener with the shared epoll loop. On each accepted
+    /// connection the relay (vsock -> pipe write end) is rebuilt. The pipe end
+    /// is unowned so tearing down the relay never closes the child's stdin.
+    private func registerStdinAccept(listener: Socket, pipe: Pipe) throws {
+        try ProcessSupervisor.default.registerFd(listener.fileDescriptor, mask: [.input]) { [weak self] _ in
+            guard let self else { return }
+            do {
+                let conn = try listener.accept(closeOnDeinit: false)
+                self.state.withLock { state in
+                    state.stdin?.close()
+                    let pair = IOPair(
+                        readFrom: conn,
+                        writeTo: UnownedIOCloser(pipe.fileHandleForWriting),
+                        reason: "StandardIO stdin",
+                        logger: self.log
+                    )
+                    state.stdin = pair
+                    do {
+                        try pair.relay()
+                    } catch {
+                        self.log?.error("failed to relay stdin: \(error)")
+                    }
+                }
+            } catch {
+                self.log?.error("failed to accept stdin connection: \(error)")
+            }
+        }
+    }
+
+    /// Register an output (stdout/stderr) listener with the shared epoll loop.
+    /// On each accepted connection the relay (pipe read end -> vsock) is
+    /// rebuilt. The pipe read end is unowned so tearing down the relay never
+    /// closes the child's output pipe.
+    private func registerOutputAccept(
+        listener: Socket,
+        pipe: Pipe,
+        reason: String,
+        store: @escaping @Sendable (inout State, IOPair?) -> Void,
+        current: @escaping @Sendable (State) -> IOPair?
+    ) throws {
+        try ProcessSupervisor.default.registerFd(listener.fileDescriptor, mask: [.input]) { [weak self] _ in
+            guard let self else { return }
+            do {
+                let conn = try listener.accept(closeOnDeinit: false)
+                self.state.withLock { state in
+                    current(state)?.close()
+                    let pair = IOPair(
+                        readFrom: UnownedIOCloser(pipe.fileHandleForReading),
+                        writeTo: conn,
+                        reason: reason,
+                        logger: self.log
+                    )
+                    store(&state, pair)
+                    do {
+                        try pair.relay()
+                    } catch {
+                        self.log?.error("failed to relay \(reason): \(error)")
+                    }
+                }
+            } catch {
+                self.log?.error("failed to accept \(reason) connection: \(error)")
             }
         }
     }
@@ -121,29 +186,34 @@ final class StandardIO: ManagedProcess.IO & Sendable {
 
     func close() throws {
         self.state.withLock {
-            if let stdin = $0.stdin {
-                stdin.close()
-                $0.stdin = nil
-            }
+            // Tear down the active relays. Each closes its owned vsock
+            // connection but leaves the unowned pipe end open.
+            $0.stdin?.close()
+            $0.stdin = nil
+            $0.stdout?.close()
+            $0.stdout = nil
+            $0.stderr?.close()
+            $0.stderr = nil
 
-            if let stdout = $0.stdout {
-                stdout.close()
-                $0.stdout = nil
-            }
+            // Stop accepting and close the listeners.
+            Self.closeListener(&$0.stdinListener)
+            Self.closeListener(&$0.stdoutListener)
+            Self.closeListener(&$0.stderrListener)
 
-            if let stderr = $0.stderr {
-                stderr.close()
-                $0.stderr = nil
-            }
+            // Close the parent-side pipe ends the relays were using.
+            try? $0.stdinPipe?.fileHandleForWriting.close()
+            try? $0.stdoutPipe?.fileHandleForReading.close()
+            try? $0.stderrPipe?.fileHandleForReading.close()
         }
     }
 
     func closeStdin() throws {
         self.state.withLock {
-            if let stdin = $0.stdin {
-                stdin.close()
-                $0.stdin = nil
-            }
+            $0.stdin?.close()
+            $0.stdin = nil
+            Self.closeListener(&$0.stdinListener)
+            // Close the write end so the child sees EOF on stdin.
+            try? $0.stdinPipe?.fileHandleForWriting.close()
         }
     }
 
@@ -151,17 +221,21 @@ final class StandardIO: ManagedProcess.IO & Sendable {
         try self.state.withLock {
             if let stdin = $0.stdinPipe {
                 try stdin.fileHandleForReading.close()
-                $0.stdinPipe = nil
             }
             if let stdout = $0.stdoutPipe {
                 try stdout.fileHandleForWriting.close()
-                $0.stdoutPipe = nil
             }
             if let stderr = $0.stderrPipe {
                 try stderr.fileHandleForWriting.close()
-                $0.stderrPipe = nil
             }
         }
+    }
+
+    private static func closeListener(_ listener: inout Socket?) {
+        guard let l = listener else { return }
+        try? ProcessSupervisor.default.unregisterFd(l.fileDescriptor)
+        try? l.close()
+        listener = nil
     }
 }
 

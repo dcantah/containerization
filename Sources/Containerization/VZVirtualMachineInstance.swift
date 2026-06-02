@@ -98,6 +98,9 @@ public final class VZVirtualMachineInstance: Sendable {
 
     // `vm` isn't used concurrently.
     private nonisolated(unsafe) let vm: VZVirtualMachine
+    // The VZ configuration `vm` was created with. Retained so we can validate
+    // save/restore support against it. `vm` isn't used concurrently.
+    private nonisolated(unsafe) let vzConfig: VZVirtualMachineConfiguration
     private let queue: DispatchQueue
     private let lock: AsyncLock
     private let group: EventLoopGroup
@@ -134,8 +137,9 @@ public final class VZVirtualMachineInstance: Sendable {
         let (mountAttachments, _) = try config.mountAttachments(allocator: allocator)
         self._mounts = Mutex(mountAttachments)
 
+        self.vzConfig = try config.toVZ(allocator: allocator)
         self.vm = VZVirtualMachine(
-            configuration: try config.toVZ(allocator: allocator),
+            configuration: self.vzConfig,
             queue: self.queue
         )
 
@@ -248,8 +252,84 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
     public func resume() async throws {
         try await lock.withLock { _ in
             try await self.vm.resume(queue: self.queue)
-            await self.timeSyncer.resume()
+            if await self.timeSyncer.wasStarted {
+                await self.timeSyncer.resume()
+            } else {
+                // The time syncer was never started (e.g. this instance was
+                // restored rather than started). Start it now that the guest is
+                // running so its clock, frozen across the save, is corrected.
+                let agent = try Vminitd(
+                    connection: try await self.vm.waitForAgent(queue: self.queue),
+                    group: self.group
+                )
+                await self.timeSyncer.start(context: agent)
+            }
         }
+    }
+
+    /// Validate that this instance's configuration can be saved and restored.
+    ///
+    /// Not all device configurations support save/restore. Call this before
+    /// relying on `save(to:)` / `restore(from:)`.
+    public func validateSaveRestoreSupport() throws {
+        #if arch(arm64)
+        do {
+            try self.vzConfig.validateSaveRestoreSupport()
+        } catch {
+            throw ContainerizationError(
+                .unsupported,
+                message: "configuration does not support save and restore",
+                cause: error
+            )
+        }
+        #else
+        throw ContainerizationError(
+            .unsupported,
+            message: "save and restore is only supported on arm64"
+        )
+        #endif
+    }
+
+    public func save(to url: URL) async throws {
+        #if arch(arm64)
+        try await lock.withLock { _ in
+            guard self.state == .paused else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "virtual machine must be paused to save, current state \(self.state)"
+                )
+            }
+            try self.validateSaveRestoreSupport()
+            try await self.vm.save(queue: self.queue, to: url)
+        }
+        #else
+        throw ContainerizationError(
+            .unsupported,
+            message: "save and restore is only supported on arm64"
+        )
+        #endif
+    }
+
+    public func restore(from url: URL) async throws {
+        #if arch(arm64)
+        try await lock.withLock { _ in
+            guard self.state == .stopped else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "virtual machine must be stopped to restore, current state \(self.state)"
+                )
+            }
+            try self.validateSaveRestoreSupport()
+            // On success the VM transitions to the paused state; the caller
+            // brings it back to running with resume().
+            try await self.vm.restore(queue: self.queue, from: url)
+        }
+        #else
+        throw ContainerizationError(
+            .unsupported,
+            message: "save and restore is only supported on arm64"
+        )
+        #endif
     }
 
     public func dialAgent() async throws -> Vminitd {
@@ -354,6 +434,8 @@ extension VZVirtualMachineInstance {
                 state = .starting
             case .running:
                 state = .running
+            case .paused:
+                state = .paused
             case .stopping:
                 state = .stopping
             case .stopped:

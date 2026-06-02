@@ -19,7 +19,7 @@ import ContainerizationExtras
 
 /// DNS configuration for a container. The values will be used to
 /// construct /etc/resolv.conf for a given container.
-public struct DNS: Sendable {
+public struct DNS: Sendable, Codable {
     /// The set of default nameservers to use if none are provided
     /// in the constructor.
     public static let defaultNameservers = ["1.1.1.1"]

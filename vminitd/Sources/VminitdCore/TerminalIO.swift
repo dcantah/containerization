@@ -22,10 +22,21 @@ import LCShim
 import Logging
 import Synchronization
 
+/// Relays a process's controlling terminal to the host over vsock.
+///
+/// Like `StandardIO`, the guest binds vsock listeners and the host dials in,
+/// with the listeners kept open for reconnection (e.g. after save/restore).
+/// The terminal fd only becomes available once the process has started, so an
+/// accepted connection and the terminal are wired together by whichever
+/// arrives second; later reconnections rewire directly.
 final class TerminalIO: ManagedProcess.IO & Sendable {
     private struct State {
-        var stdinSocket: Socket?
-        var stdoutSocket: Socket?
+        var stdinListener: Socket?
+        var stdoutListener: Socket?
+
+        // Connections accepted before the terminal is available, awaiting wiring.
+        var pendingStdinConn: Socket?
+        var pendingStdoutConn: Socket?
 
         var stdin: IOPair?
         var stdout: IOPair?
@@ -59,19 +70,16 @@ final class TerminalIO: ManagedProcess.IO & Sendable {
             process.stdout = nil
             process.stderr = nil
 
-            // Bind both listeners before accepting so the host can dial either
-            // port without waiting on the other. The host is the dialer; we
-            // listen so the connections can be re-established after a
-            // save/restore.
-            let stdinListener = try self.hostStdio.stdin.map { try VsockStdio.bind(port: $0) }
-            let stdoutListener = try self.hostStdio.stdout.map { try VsockStdio.bind(port: $0) }
-
-            if let stdinListener {
-                $0.stdinSocket = try VsockStdio.accept(listener: stdinListener)
+            if let stdinPort = self.hostStdio.stdin {
+                let listener = try VsockStdio.bind(port: stdinPort)
+                $0.stdinListener = listener
+                try self.registerStdinAccept(listener: listener)
             }
 
-            if let stdoutListener {
-                $0.stdoutSocket = try VsockStdio.accept(listener: stdoutListener)
+            if let stdoutPort = self.hostStdio.stdout {
+                let listener = try VsockStdio.bind(port: stdoutPort)
+                $0.stdoutListener = listener
+                try self.registerStdoutAccept(listener: listener)
             }
         }
     }
@@ -92,56 +100,122 @@ final class TerminalIO: ManagedProcess.IO & Sendable {
             let term = try Terminal(descriptor: Int32(hostFd), setInitState: false)
             $0.parent = term
 
-            if let stdinSocket = $0.stdinSocket {
-                let pair = IOPair(
-                    readFrom: stdinSocket,
-                    writeTo: UnownedIOCloser(term),
-                    reason: "TerminalIO stdin",
-                    logger: log
-                )
-                try pair.relay(ignoreHup: true)
-                $0.stdin = pair
+            // Wire up any connections that were accepted before the terminal
+            // existed.
+            if let conn = $0.pendingStdinConn {
+                $0.pendingStdinConn = nil
+                self.wireStdin(&$0, conn: conn, terminal: term)
             }
+            if let conn = $0.pendingStdoutConn {
+                $0.pendingStdoutConn = nil
+                self.wireStdout(&$0, conn: conn, terminal: term)
+            }
+        }
+    }
 
-            if let stdoutSocket = $0.stdoutSocket {
-                let pair = IOPair(
-                    readFrom: term,
-                    writeTo: stdoutSocket,
-                    reason: "TerminalIO stdout",
-                    logger: log
-                )
-                try pair.relay(ignoreHup: true)
-                $0.stdout = pair
+    private func registerStdinAccept(listener: Socket) throws {
+        try ProcessSupervisor.default.registerFd(listener.fileDescriptor, mask: [.input]) { [weak self] _ in
+            guard let self else { return }
+            do {
+                let conn = try listener.accept(closeOnDeinit: false)
+                self.state.withLock { state in
+                    state.stdin?.close()
+                    state.stdin = nil
+                    if let prev = state.pendingStdinConn {
+                        try? prev.close()
+                        state.pendingStdinConn = nil
+                    }
+                    if let term = state.parent {
+                        self.wireStdin(&state, conn: conn, terminal: term)
+                    } else {
+                        state.pendingStdinConn = conn
+                    }
+                }
+            } catch {
+                self.log?.error("failed to accept terminal stdin connection: \(error)")
             }
+        }
+    }
+
+    private func registerStdoutAccept(listener: Socket) throws {
+        try ProcessSupervisor.default.registerFd(listener.fileDescriptor, mask: [.input]) { [weak self] _ in
+            guard let self else { return }
+            do {
+                let conn = try listener.accept(closeOnDeinit: false)
+                self.state.withLock { state in
+                    state.stdout?.close()
+                    state.stdout = nil
+                    if let prev = state.pendingStdoutConn {
+                        try? prev.close()
+                        state.pendingStdoutConn = nil
+                    }
+                    if let term = state.parent {
+                        self.wireStdout(&state, conn: conn, terminal: term)
+                    } else {
+                        state.pendingStdoutConn = conn
+                    }
+                }
+            } catch {
+                self.log?.error("failed to accept terminal stdout connection: \(error)")
+            }
+        }
+    }
+
+    // The terminal fd is unowned by both relays; it belongs to the process and
+    // is closed in close(). Only the stdout relay registers it with epoll (as
+    // its read source), so it must be torn down before the terminal is closed.
+    private func wireStdin(_ state: inout State, conn: Socket, terminal: Terminal) {
+        let pair = IOPair(
+            readFrom: conn,
+            writeTo: UnownedIOCloser(terminal),
+            reason: "TerminalIO stdin",
+            logger: log
+        )
+        do {
+            try pair.relay(ignoreHup: true)
+            state.stdin = pair
+        } catch {
+            self.log?.error("failed to relay terminal stdin: \(error)")
+            try? conn.close()
+        }
+    }
+
+    private func wireStdout(_ state: inout State, conn: Socket, terminal: Terminal) {
+        let pair = IOPair(
+            readFrom: UnownedIOCloser(terminal),
+            writeTo: conn,
+            reason: "TerminalIO stdout",
+            logger: log
+        )
+        do {
+            try pair.relay(ignoreHup: true)
+            state.stdout = pair
+        } catch {
+            self.log?.error("failed to relay terminal stdout: \(error)")
+            try? conn.close()
         }
     }
 
     func close() throws {
         self.state.withLock {
-            // stdout must close before stdin because both IOPairs share the
-            // Terminal fd. stdout registered that fd with epoll (as its read
-            // source) and needs to unregister it while the fd is still valid.
-            // stdin closes the Terminal as its write destination, which would
-            // invalidate the fd before stdout can unregister.
-            if let stdout = $0.stdout {
-                stdout.close()
-                $0.stdout = nil
-            }
-            if let stdin = $0.stdin {
-                stdin.close()
-                $0.stdin = nil
-            }
+            // stdout must close before stdin because the stdout relay registered
+            // the terminal fd with epoll and needs to unregister it while the fd
+            // is still valid.
+            $0.stdout?.close()
+            $0.stdout = nil
+            $0.stdin?.close()
+            $0.stdin = nil
 
-            // If IOPairs were never created (process exited before attach),
-            // close the raw sockets directly since they have closeOnDeinit
-            // disabled.
-            if let stdinSocket = $0.stdinSocket {
-                try? stdinSocket.close()
-                $0.stdinSocket = nil
+            Self.closeListener(&$0.stdinListener)
+            Self.closeListener(&$0.stdoutListener)
+
+            if let conn = $0.pendingStdinConn {
+                try? conn.close()
+                $0.pendingStdinConn = nil
             }
-            if let stdoutSocket = $0.stdoutSocket {
-                try? stdoutSocket.close()
-                $0.stdoutSocket = nil
+            if let conn = $0.pendingStdoutConn {
+                try? conn.close()
+                $0.pendingStdoutConn = nil
             }
 
             $0.parent = nil
@@ -153,11 +227,21 @@ final class TerminalIO: ManagedProcess.IO & Sendable {
 
     func closeStdin() throws {
         self.state.withLock {
-            if let stdin = $0.stdin {
-                stdin.close()
-                $0.stdin = nil
+            $0.stdin?.close()
+            $0.stdin = nil
+            Self.closeListener(&$0.stdinListener)
+            if let conn = $0.pendingStdinConn {
+                try? conn.close()
+                $0.pendingStdinConn = nil
             }
         }
+    }
+
+    private static func closeListener(_ listener: inout Socket?) {
+        guard let l = listener else { return }
+        try? ProcessSupervisor.default.unregisterFd(l.fileDescriptor)
+        try? l.close()
+        listener = nil
     }
 }
 

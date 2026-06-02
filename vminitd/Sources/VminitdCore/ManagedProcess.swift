@@ -136,8 +136,9 @@ final class ManagedProcess: ContainerProcess, Sendable {
 
         log.info("starting I/O")
 
-        // Setup IO early. We bind the stdio vsock listeners here and block
-        // until the host dials each one, so the connections are live before
+        // Setup IO early. We bind the stdio vsock listeners here and start
+        // accepting on the shared epoll loop. The host dials in and only starts
+        // the process once its dials have connected, so stdio is live before
         // the process execs.
         try io.start(process: &command)
 

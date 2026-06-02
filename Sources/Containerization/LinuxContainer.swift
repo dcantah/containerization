@@ -379,6 +379,35 @@ public final class LinuxContainer: Container, Sendable {
         )
     }
 
+    /// Resolve every interface to one carrying a stable MAC address.
+    ///
+    /// Interfaces that did not specify a MAC are assigned one derived
+    /// deterministically from the container id and interface index, so create
+    /// and restore produce the same MAC and the saved VM configuration matches.
+    private func resolvedInterfaces() -> [any Interface] {
+        self.interfaces.enumerated().map { index, iface in
+            iface.resolvingMACAddress(Self.generatedMACAddress(containerID: self.id, index: index))
+        }
+    }
+
+    /// Deterministically derive a locally administered, unicast MAC address
+    /// from the container id and interface index.
+    static func generatedMACAddress(containerID: String, index: Int) -> MACAddress {
+        // FNV-1a over a stable string. Swift's Hasher is per-process randomized
+        // and so unsuitable for a value that must be reproduced on restore.
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in "\(containerID)/eth\(index)".utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        // Keep the low 48 bits, then force the first octet to be locally
+        // administered (bit 1 set) and unicast (bit 0 clear).
+        let masked = hash & 0x0000_ffff_ffff_ffff
+        let firstOctet = (UInt8((masked >> 40) & 0xff) & 0xFE) | 0x02
+        let value = (masked & 0x0000_00ff_ffff_ffff) | (UInt64(firstOctet) << 40)
+        return MACAddress(value)
+    }
+
     private func generateRuntimeSpec() -> Spec {
         var spec = Self.createDefaultRuntimeSpec(id)
 
@@ -582,7 +611,7 @@ extension LinuxContainer {
             let vmConfig = VMConfiguration(
                 cpus: vmCpus,
                 memoryInBytes: vmMemory,
-                interfaces: self.interfaces,
+                interfaces: self.resolvedInterfaces(),
                 mountsByID: [self.id: containerMounts],
                 bootLog: self.config.bootLog,
                 nestedVirtualization: self.config.virtualization
@@ -911,6 +940,315 @@ extension LinuxContainer {
             }
             state = .started(.init(pausedState))
         }
+    }
+
+    /// File name of the virtual machine state within a save bundle directory.
+    public static let vmStateFileName = "container.state"
+    /// File name of the container metadata within a save bundle directory.
+    public static let snapshotFileName = "snapshot.json"
+
+    /// Save the container to a bundle directory so it can later be restored
+    /// with `LinuxContainer.restore(from:vmm:)`.
+    ///
+    /// The container must be paused with its virtual machine also paused
+    /// (`pause(virtualMachine: true)`), since the virtual machine state can
+    /// only be captured while the VM is in the paused state. Writes the VM
+    /// state file and a `ContainerSnapshot` holding the container-level
+    /// configuration and runtime metadata needed to reconnect on restore.
+    ///
+    /// The bundle is written to a temporary directory and atomically moved into
+    /// place, so a crash mid-save never leaves a partial bundle at `directory`.
+    public func save(to directory: URL) async throws {
+        try await self.state.withLock { state in
+            let pausedState = try state.pausedState("save")
+            guard pausedState.virtualMachinePaused else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "container's virtual machine must be paused to save; call pause(virtualMachine: true)"
+                )
+            }
+
+            // Capture the active relays so their host side can be rebuilt on
+            // restore. The guest side persists in the saved VM memory.
+            let socketRelays = await pausedState.relayManager.assignments().map { assignment in
+                ContainerSnapshot.SocketRelaySnapshot(
+                    id: assignment.configuration.id,
+                    source: assignment.configuration.source,
+                    destination: assignment.configuration.destination,
+                    permissions: assignment.configuration.permissions.map { UInt32($0.rawValue) },
+                    direction: assignment.configuration.direction == .into ? .into : .outOf,
+                    port: assignment.port
+                )
+            }
+
+            let snapshot = ContainerSnapshot(
+                id: self.id,
+                rootfs: self.rootfs,
+                writableLayer: self.writableLayer,
+                mounts: self.config.mounts,
+                socketRelays: socketRelays,
+                cpus: self.cpus,
+                memoryInBytes: self.memoryInBytes,
+                cpuOverhead: self.config.cpuOverhead,
+                memoryOverhead: self.config.memoryOverhead,
+                nestedVirtualization: self.config.virtualization,
+                hostVsockPortCursor: self.hostVsockPorts.load(ordering: .relaxed),
+                guestVsockPortCursor: self.guestVsockPorts.load(ordering: .relaxed),
+                process: pausedState.process.snapshot(),
+                vendedProcesses: pausedState.vendedProcesses.values.map { $0.snapshot() }
+            )
+
+            // Stage the bundle in a sibling temp directory, then swap it in
+            // atomically.
+            let fm = FileManager.default
+            let parent = directory.deletingLastPathComponent()
+            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+            let staging = parent.appendingPathComponent(".\(directory.lastPathComponent).save.\(UUID().uuidString)")
+            try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+
+            do {
+                try await pausedState.vm.save(
+                    to: staging.appendingPathComponent(Self.vmStateFileName)
+                )
+                try snapshot.encoded().write(
+                    to: staging.appendingPathComponent(Self.snapshotFileName)
+                )
+
+                if fm.fileExists(atPath: directory.path) {
+                    _ = try fm.replaceItemAt(directory, withItemAt: staging)
+                } else {
+                    try fm.moveItem(at: staging, to: directory)
+                }
+            } catch {
+                try? fm.removeItem(at: staging)
+                throw error
+            }
+        }
+    }
+
+    /// Restore a container previously saved with `save(to:)`.
+    ///
+    /// The container-level configuration and runtime metadata are read from the
+    /// bundle; the caller supplies the live host state the bundle cannot carry:
+    /// the virtual machine manager (which owns the kernel, initial filesystem,
+    /// and rosetta toggle), the network interfaces, and the process stdio. The
+    /// manager and interfaces must be equivalent to the ones that produced the
+    /// bundle (same kernel image; interfaces yielding the same MAC addresses, so
+    /// the rebuilt VM configuration matches the saved state). Network backends
+    /// are recreated fresh by Virtualization.framework on restore, so a live,
+    /// subnet-compatible network must be supplied here for vmnet interfaces.
+    ///
+    /// On success the returned container is paused with its virtual machine
+    /// running but its cgroup still frozen (mirroring a container saved via
+    /// `pause(virtualMachine: true)`); call `resume()` to thaw it.
+    ///
+    /// - Parameters:
+    ///   - directory: The bundle directory written by `save(to:)`.
+    ///   - vmm: The virtual machine manager used to rebuild the VM.
+    ///   - interfaces: The network interfaces, equivalent to those the container
+    ///     was created with. Defaults to none.
+    ///   - stdin: Source for the restored init process's standard input, if any.
+    ///   - stdout: Destination for the restored init process's standard output, if any.
+    ///   - stderr: Destination for the restored init process's standard error, if any.
+    ///   - execStdio: Supplies the host stdio for each restored exec process,
+    ///     keyed by its id. Streams not provided are drained/EOF'd so the exec
+    ///     does not block. If nil, all exec streams are drained.
+    ///   - logger: Optional logger for the restored container.
+    public static func restore(
+        from directory: URL,
+        vmm: VirtualMachineManager,
+        interfaces: [any Interface] = [],
+        stdin: ReaderStream? = nil,
+        stdout: Writer? = nil,
+        stderr: Writer? = nil,
+        execStdio: (@Sendable (_ id: String) -> ProcessStdio)? = nil,
+        logger: Logger? = nil
+    ) async throws -> LinuxContainer {
+        let data = try Data(contentsOf: directory.appendingPathComponent(Self.snapshotFileName))
+        let snapshot = try ContainerSnapshot.decode(from: data)
+
+        var process = LinuxProcessConfiguration()
+        process.stdin = stdin
+        process.stdout = stdout
+        process.stderr = stderr
+
+        var configuration = Configuration(process: process)
+        configuration.cpus = snapshot.cpus
+        configuration.memoryInBytes = snapshot.memoryInBytes
+        configuration.cpuOverhead = snapshot.cpuOverhead
+        configuration.memoryOverhead = snapshot.memoryOverhead
+        configuration.virtualization = snapshot.nestedVirtualization
+        configuration.mounts = snapshot.mounts
+        configuration.interfaces = interfaces
+        configuration.sockets = snapshot.socketRelays.map { Self.socketConfiguration(from: $0) }
+
+        let container = try LinuxContainer(
+            snapshot.id,
+            rootfs: snapshot.rootfs,
+            writableLayer: snapshot.writableLayer,
+            vmm: vmm,
+            configuration: configuration,
+            logger: logger
+        )
+        try await container.completeRestore(from: directory, snapshot: snapshot, execStdio: execStdio)
+        return container
+    }
+
+    /// Rebuild the virtual machine from the bundle, restore its saved state,
+    /// resume it, and reconnect the init and exec processes, leaving this
+    /// container paused.
+    private func completeRestore(
+        from directory: URL,
+        snapshot: ContainerSnapshot,
+        execStdio: (@Sendable (_ id: String) -> ProcessStdio)?
+    ) async throws {
+        try await self.state.withLock { state in
+            try state.validateForCreate()
+
+            // Resume the port allocators where the saved container left off so
+            // future allocations do not collide with ports still in use by the
+            // restored guest.
+            self.hostVsockPorts.store(snapshot.hostVsockPortCursor, ordering: .relaxed)
+            self.guestVsockPorts.store(snapshot.guestVsockPortCursor, ordering: .relaxed)
+
+            // Rebuild the VM with a configuration identical to the saved one.
+            // Reusing the same inputs (kernel, rootfs, mounts, interfaces) is
+            // what lets Virtualization.framework accept the saved state.
+            var modifiedRootfs = self.rootfs
+            modifiedRootfs.options.removeAll(where: { $0 == "ro" })
+
+            let vmMemory = self.memoryInBytes + self.config.memoryOverhead
+            let vmCpus = self.cpus + self.config.cpuOverhead
+
+            let fileMountContext = try FileMountContext.prepare(mounts: self.config.mounts)
+            var containerMounts = [modifiedRootfs] + fileMountContext.transformedMounts
+            if let writableLayer = self.writableLayer {
+                containerMounts.insert(writableLayer, at: 1)
+            }
+
+            let vmConfig = VMConfiguration(
+                cpus: vmCpus,
+                memoryInBytes: vmMemory,
+                interfaces: self.resolvedInterfaces(),
+                mountsByID: [self.id: containerMounts],
+                bootLog: self.config.bootLog,
+                nestedVirtualization: self.config.virtualization
+            )
+            let creationConfig = StandardVMConfig(configuration: vmConfig)
+            let vm = try await self.vmm.create(config: creationConfig)
+            let relayManager = UnixSocketRelayManager(vm: vm, log: self.logger)
+
+            do {
+                // Restore the saved machine state (the VM lands paused) then
+                // resume the VM so the guest can accept reconnections.
+                try await vm.restore(from: directory.appendingPathComponent(Self.vmStateFileName))
+                try await vm.resume()
+
+                let agent = try await vm.dialAgent()
+
+                let initIO = ProcessStdio(
+                    stdin: self.config.process.stdin,
+                    stdout: self.config.process.stdout,
+                    stderr: self.config.process.stderr
+                )
+                let stdio = Self.reattachStdio(snapshot: snapshot.process, io: initIO)
+                let process = LinuxProcess(
+                    self.id,
+                    containerID: self.id,
+                    spec: self.generateRuntimeSpec(),
+                    io: stdio,
+                    ociRuntimePath: self.config.ociRuntimePath,
+                    agent: agent,
+                    vm: vm,
+                    logger: self.logger
+                )
+                try await process.reattach(pid: snapshot.process.pid)
+
+                // Re-establish the host side of each unix socket relay on the
+                // saved port. The guest side (a VsockProxy in vminitd) persists
+                // in the restored VM memory, so we do not re-run the guest-side
+                // relaySocket, only relayManager.start. config.sockets carries
+                // the same ids so stop() can still tear the guest proxies down.
+                for relay in snapshot.socketRelays {
+                    try await relayManager.start(
+                        port: relay.port,
+                        socket: Self.socketConfiguration(from: relay)
+                    )
+                }
+
+                // Land in the paused state: VM running, cgroup still frozen.
+                // resume() thaws the container's cgroup.
+                let createdState = State.CreatedState(
+                    vm: vm,
+                    relayManager: relayManager,
+                    fileMountContext: fileMountContext
+                )
+                var startedState = State.StartedState(createdState, process: process)
+
+                // Reconnect any exec processes the same way as the init process.
+                for vended in snapshot.vendedProcesses {
+                    let execID = vended.id
+                    let io = execStdio?(execID) ?? ProcessStdio()
+                    let execAgent = try await vm.dialAgent()
+                    let execProcess = LinuxProcess(
+                        execID,
+                        containerID: self.id,
+                        spec: self.generateRuntimeSpec(),
+                        io: Self.reattachStdio(snapshot: vended, io: io),
+                        ociRuntimePath: self.config.ociRuntimePath,
+                        agent: execAgent,
+                        vm: vm,
+                        logger: self.logger,
+                        onDelete: { [weak self] in
+                            await self?.removeProcess(id: execID)
+                        }
+                    )
+                    try await execProcess.reattach(pid: vended.pid)
+                    startedState.vendedProcesses[execID] = execProcess
+                }
+
+                state = .paused(.init(startedState, virtualMachinePaused: false))
+            } catch {
+                try? await vm.stop()
+                state.setErrored(error: error)
+                throw error
+            }
+        }
+    }
+
+    /// Rebuild the stdio setup for a restored process, pairing the saved ports
+    /// with the caller-supplied IO. Any stream the guest is listening on but
+    /// the caller did not supply gets a discard/empty default so the restored
+    /// process is never blocked writing to (or reading from) a dead port.
+    private static func reattachStdio(
+        snapshot: ContainerSnapshot.ProcessSnapshot,
+        io: ProcessStdio
+    ) -> LinuxProcess.Stdio {
+        let stdin = snapshot.stdinPort.map {
+            LinuxProcess.StdioReaderSetup(port: $0, reader: io.stdin ?? EmptyReader())
+        }
+        let stdout = snapshot.stdoutPort.map {
+            LinuxProcess.StdioSetup(port: $0, writer: io.stdout ?? DiscardWriter())
+        }
+        let stderr = snapshot.stderrPort.map {
+            LinuxProcess.StdioSetup(port: $0, writer: io.stderr ?? DiscardWriter())
+        }
+        return LinuxProcess.Stdio(stdin: stdin, stdout: stdout, stderr: stderr)
+    }
+
+    /// Reconstruct a unix socket relay configuration from its snapshot,
+    /// preserving the original id so the guest-side proxy can be matched.
+    private static func socketConfiguration(
+        from snapshot: ContainerSnapshot.SocketRelaySnapshot
+    ) -> UnixSocketConfiguration {
+        let permissions = snapshot.permissions.map { FilePermissions(rawValue: CInterop.Mode($0)) }
+        return UnixSocketConfiguration(
+            id: snapshot.id,
+            source: snapshot.source,
+            destination: snapshot.destination,
+            permissions: permissions,
+            direction: snapshot.direction == .into ? .into : .outOf
+        )
     }
 
     /// Send a signal to the container.

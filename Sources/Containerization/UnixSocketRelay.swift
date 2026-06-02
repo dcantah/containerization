@@ -29,6 +29,13 @@ package final class UnixSocketRelay: Sendable {
     private let log: Logger?
     private let state: Mutex<State>
 
+    /// The vsock port this relay uses. Captured when saving so the host side
+    /// can be re-established on the same port after a restore.
+    package var relayPort: UInt32 { port }
+
+    /// The configuration this relay was created with.
+    package var relayConfiguration: UnixSocketConfiguration { configuration }
+
     private struct State {
         var activeRelays: [String: BidirectionalRelay] = [:]
         var t: Task<(), Never>? = nil

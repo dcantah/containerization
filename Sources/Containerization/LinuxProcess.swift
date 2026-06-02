@@ -92,6 +92,20 @@ public final class LinuxProcess: Sendable {
         state.withLock { $0.pid }
     }
 
+    /// Capture the runtime state needed to re-establish this process's stdio
+    /// after a virtual machine restore.
+    package func snapshot() -> ContainerSnapshot.ProcessSnapshot {
+        self.state.withLock { state in
+            ContainerSnapshot.ProcessSnapshot(
+                id: self.id,
+                pid: state.pid,
+                stdinPort: self.ioSetup.stdin?.port,
+                stdoutPort: self.ioSetup.stdout?.port,
+                stderrPort: self.ioSetup.stderr?.port
+            )
+        }
+    }
+
     private let state: Mutex<State>
     private let ioSetup: Stdio
     private let agent: any VirtualMachineAgent
@@ -321,6 +335,40 @@ extension LinuxProcess {
             throw ContainerizationError(
                 .internalError,
                 message: "failed to start process",
+                cause: error,
+            )
+        }
+    }
+
+    /// Re-establish the host side of an already-running process after a
+    /// virtual machine restore.
+    ///
+    /// The process is still running in the guest with its stdio listeners
+    /// bound, so this re-dials those listeners and rewires the relays rather
+    /// than creating and starting a new process.
+    func reattach(pid: Int32) async throws {
+        do {
+            let handles = try await self.setupIO()
+
+            if let stdinHandle = handles[0] {
+                self.startStdinRelay(handle: stdinHandle)
+            }
+
+            self.state.withLock {
+                $0.stdio = StdioHandles(
+                    stdin: handles[0],
+                    stdout: handles[1],
+                    stderr: handles[2]
+                )
+                $0.pid = pid
+            }
+        } catch {
+            if let err = error as? ContainerizationError {
+                throw err
+            }
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to reattach process",
                 cause: error,
             )
         }

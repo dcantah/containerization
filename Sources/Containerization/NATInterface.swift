@@ -16,7 +16,7 @@
 
 import ContainerizationExtras
 
-public struct NATInterface: Interface {
+public struct NATInterface: Interface, Codable {
     public var ipv4Address: CIDRv4
     public var ipv4Gateway: IPv4Address?
     public var macAddress: MACAddress?
@@ -27,5 +27,12 @@ public struct NATInterface: Interface {
         self.ipv4Gateway = ipv4Gateway
         self.macAddress = macAddress
         self.mtu = mtu
+    }
+
+    public func resolvingMACAddress(_ macAddress: MACAddress) -> any Interface {
+        guard self.macAddress == nil else { return self }
+        var copy = self
+        copy.macAddress = macAddress
+        return copy
     }
 }

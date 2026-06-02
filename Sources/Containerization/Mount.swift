@@ -22,7 +22,7 @@ import Virtualization
 #endif
 
 /// A filesystem mount exposed to a container.
-public struct Mount: Sendable {
+public struct Mount: Sendable, Codable {
     /// The filesystem or mount type. This is the string
     /// that will be used for the mount syscall itself.
     public var type: String
@@ -41,7 +41,7 @@ public struct Mount: Sendable {
     /// A type representing a "hint" of what type
     /// of mount this really is (block, directory, purely
     /// guest mount) and a set of type specific options, if any.
-    public enum RuntimeOptions: Sendable {
+    public enum RuntimeOptions: Sendable, Codable {
         case virtioblk([String])
         case virtiofs([String])
         case shared
